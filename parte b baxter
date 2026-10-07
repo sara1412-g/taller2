@@ -1,0 +1,342 @@
+"""
+PARTE B
+Baxter en PyBullet controlado por ESP32.
+
+Comandos:
+    B,x,y,z
+    GRAB
+    RELEASE
+    STOP
+    RESET
+
+Ejemplo:
+    python parte_b/baxter_server.py --robot_repo ./pybullet_robots
+"""
+
+import argparse
+import math
+import os
+import socket
+import threading
+import time
+
+import numpy as np
+import pybullet as p
+import pybullet_data
+
+
+HOST = "0.0.0.0"
+PORT = 5000
+
+TARGET = np.array([0.20, 0.00, -0.10], dtype=float)
+
+LOCK = threading.Lock()
+RUNNING = True
+
+GRASP_CONSTRAINT = None
+OBJECT_ID = None
+BAXTER_ID = None
+END_EFFECTOR = 48
+
+
+def clamp(v, low, high):
+    return max(low, min(high, v))
+
+
+def parse_command(line):
+    global TARGET, GRASP_CONSTRAINT
+
+    line = line.strip()
+
+    if line.upper() == "STOP":
+        return "OK STOP"
+
+    if line.upper() == "GRAB":
+        grab_object()
+        return "OK GRAB"
+
+    if line.upper() == "RELEASE":
+        release_object()
+        return "OK RELEASE"
+
+    if line.upper() == "RESET":
+        reset_scene()
+        return "OK RESET"
+
+    parts = line.split(",")
+
+    if len(parts) == 4 and parts[0].upper() == "B":
+        try:
+            # Limites conservadores para evitar referencias absurdas.
+            x = clamp(float(parts[1]), -0.2, 0.7)
+            y = clamp(float(parts[2]), -0.8, 0.8)
+            z = clamp(float(parts[3]), -0.4, 0.4)
+        except ValueError:
+            return "ERROR NUMERIC"
+
+        with LOCK:
+            TARGET[:] = [x, y, z]
+
+        return "OK TARGET"
+
+    return "ERROR COMMAND"
+
+
+def client_worker(conn, address):
+    print(f"[TCP] Cliente: {address}")
+
+    try:
+        buffer = b""
+
+        while RUNNING:
+            data = conn.recv(1024)
+            if not data:
+                break
+
+            buffer += data
+
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="ignore")
+                response = parse_command(line)
+                conn.sendall((response + "\n").encode())
+
+    except ConnectionResetError:
+        pass
+    finally:
+        conn.close()
+
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(2)
+
+    print(f"[TCP] Baxter escuchando en puerto {PORT}")
+
+    while RUNNING:
+        conn, address = server.accept()
+        threading.Thread(
+            target=client_worker,
+            args=(conn, address),
+            daemon=True
+        ).start()
+
+
+def find_joint_by_name(body, names):
+    wanted = set(names)
+
+    for i in range(p.getNumJoints(body)):
+        info = p.getJointInfo(body, i)
+        name = info[1].decode("utf-8")
+
+        if name in wanted:
+            return i
+
+    return None
+
+
+def move_arm(target):
+    """Cinemática inversa y control de posición."""
+    global BAXTER_ID
+
+    joint_poses = p.calculateInverseKinematics(
+        BAXTER_ID,
+        END_EFFECTOR,
+        target.tolist()
+    )
+
+    for i in range(p.getNumJoints(BAXTER_ID)):
+        info = p.getJointInfo(BAXTER_ID, i)
+        q_index = info[3]
+        pose_index = q_index - 7
+
+        # El modelo de Baxter del repositorio referencia los índices
+        # articulares del resultado de IK con el desplazamiento -7,
+        # tal como se hace en baxter_ik_demo.py.
+        if pose_index >= 0 and pose_index < len(joint_poses):
+            p.setJointMotorControl2(
+                bodyIndex=BAXTER_ID,
+                jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=joint_poses[pose_index],
+                force=200
+            )
+
+
+def create_object():
+    global OBJECT_ID
+
+    collision = p.createCollisionShape(
+        p.GEOM_BOX,
+        halfExtents=[0.04, 0.04, 0.04]
+    )
+
+    visual = p.createVisualShape(
+        p.GEOM_BOX,
+        halfExtents=[0.04, 0.04, 0.04],
+        rgbaColor=[0.9, 0.2, 0.1, 1]
+    )
+
+    OBJECT_ID = p.createMultiBody(
+        baseMass=0.2,
+        baseCollisionShapeIndex=collision,
+        baseVisualShapeIndex=visual,
+        basePosition=[0.30, 0.0, 0.04]
+    )
+
+
+def grab_object():
+    global GRASP_CONSTRAINT
+
+    if GRASP_CONSTRAINT is not None:
+        return
+
+    if OBJECT_ID is None:
+        return
+
+    state = p.getLinkState(BAXTER_ID, END_EFFECTOR)
+    ee_pos = np.array(state[4])
+
+    obj_pos, _ = p.getBasePositionAndOrientation(OBJECT_ID)
+    distance = np.linalg.norm(ee_pos - np.array(obj_pos))
+
+    print(f"[GRAB] Distancia efector-objeto: {distance:.3f} m")
+
+    # Se permite agarre cuando el efector está cerca.
+    if distance < 0.18:
+        GRASP_CONSTRAINT = p.createConstraint(
+            parentBodyUniqueId=BAXTER_ID,
+            parentLinkIndex=END_EFFECTOR,
+            childBodyUniqueId=OBJECT_ID,
+            childLinkIndex=-1,
+            jointType=p.JOINT_FIXED,
+            jointAxis=[0, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0]
+        )
+
+        print("[GRAB] Objeto agarrado.")
+    else:
+        print("[GRAB] Objeto demasiado lejos.")
+
+
+def release_object():
+    global GRASP_CONSTRAINT
+
+    if GRASP_CONSTRAINT is not None:
+        p.removeConstraint(GRASP_CONSTRAINT)
+        GRASP_CONSTRAINT = None
+        print("[RELEASE] Objeto liberado.")
+
+
+def reset_scene():
+    global GRASP_CONSTRAINT
+
+    release_object()
+
+    p.resetBasePositionAndOrientation(
+        BAXTER_ID,
+        [0.5, -0.8, 0.0],
+        [0.0, 0.0, -1.0, -1.0]
+    )
+
+    p.resetBasePositionAndOrientation(
+        OBJECT_ID,
+        [0.30, 0.0, 0.04],
+        [0, 0, 0, 1]
+    )
+
+    with LOCK:
+        TARGET[:] = [0.20, 0.00, -0.10]
+
+
+def load_baxter(robot_repo):
+    global BAXTER_ID
+
+    robot_repo = os.path.abspath(robot_repo)
+
+    data_path = os.path.join(
+        robot_repo,
+        "data"
+    )
+
+    # El repositorio original contiene los recursos de Baxter.
+    p.setAdditionalSearchPath(data_path)
+
+    urdf = os.path.join(
+        data_path,
+        "baxter_common",
+        "baxter_description",
+        "urdf",
+        "toms_baxter.urdf"
+    )
+
+    if not os.path.exists(urdf):
+        raise FileNotFoundError(
+            "No se encontró toms_baxter.urdf. "
+            "Verifique --robot_repo."
+        )
+
+    BAXTER_ID = p.loadURDF(
+        urdf,
+        useFixedBase=True
+    )
+
+
+def main():
+    global RUNNING
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--robot_repo",
+        default="./pybullet_robots",
+        help="Ruta al repositorio pybullet_robots"
+    )
+    args = parser.parse_args()
+
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -9.81)
+
+    load_baxter(args.robot_repo)
+
+    create_object()
+
+    p.resetDebugVisualizerCamera(
+        cameraDistance=2.0,
+        cameraYaw=180,
+        cameraPitch=-15,
+        cameraTargetPosition=[0.4, 0, 0.3]
+    )
+
+    threading.Thread(
+        target=start_server,
+        daemon=True
+    ).start()
+
+    print("PARTE B lista.")
+    print("Use la ESP32 o envíe comandos TCP.")
+    print("Ctrl+C para finalizar.")
+
+    try:
+        while True:
+            with LOCK:
+                target = TARGET.copy()
+
+            move_arm(target)
+
+            p.stepSimulation()
+            time.sleep(1 / 240)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        RUNNING = False
+        p.disconnect()
+
+
+if __name__ == "__main__":
+    main()
