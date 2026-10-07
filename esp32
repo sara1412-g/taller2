@@ -1,177 +1,111 @@
-#include <WiFi.h>
+/*
+ * esp32_console.ino - Consola de mandos con ESP32 (2 joysticks analogicos + 4 botones)
+ *
+ * Envia por USB-serie (115200) tramas:   $J,lx,ly,rx,ry,btn*CS\n   a 50 Hz
+ *   ejes en [-1000,1000], btn = mascara (bit0=A, bit1=B, bit2=C, bit3=D),
+ *   CS = XOR de los caracteres entre '$' y '*' (hex, 2 digitos).
+ * Recibe del PC:  "L1\n" / "L0\n"  -> enciende/apaga el LED externo (pinza cerrada).
+ *
+ * Conexiones (solo pines ADC1 para los ejes, ADC2 se bloquea con WiFi/BT):
+ *   Joystick izq : VRx -> GPIO34 (lx)   VRy -> GPIO35 (ly)   +5V->3V3  GND->GND
+ *   Joystick der : VRx -> GPIO32 (rx)   VRy -> GPIO33 (ry)   +5V->3V3  GND->GND
+ *   Botones (al GND, usan INPUT_PULLUP): A->GPIO25  B->GPIO26  C->GPIO27  D->GPIO14
+ *   LED de estado (con resistencia 220 ohm): GPIO4 ; LED de latido: GPIO2 (integrado)
+ *
+ * Placa en Arduino IDE: "ESP32 Dev Module", Upload speed 921600.
+ */
 
-// ===================== CONFIGURACION =====================
-const char* SSID = "TU_WIFI";
-const char* PASSWORD = "TU_PASSWORD";
+const int PIN_AXIS[4] = {34, 35, 32, 33};          // lx, ly, rx, ry
+const int PIN_BTN[4]  = {25, 26, 27, 14};          // A, B, C, D
+const int PIN_LED_STATE = 4;
+const int PIN_LED_BEAT  = 2;
 
-// IP DEL COMPUTADOR QUE EJECUTA PYTHON
-IPAddress SERVER_IP(192, 168, 1, 100);
-const uint16_t SERVER_PORT = 5000;
+const float DEADZONE = 0.08f;                      // zona muerta (fraccion del recorrido)
+const unsigned long PERIOD_MS = 20;                // 50 Hz
+const unsigned long DEBOUNCE_MS = 15;
 
-WiFiClient client;
+int center[4];
+// invertir un eje si el joystick esta montado al reves (1 o -1)
+const int SIGN[4] = {1, -1, 1, -1};               // ly y ry: arriba = positivo
 
-// ===================== PINES =============================
-const int PIN_JOY_X = 34;
-const int PIN_JOY_Y = 35;
-const int PIN_Z     = 32;
+bool btnState[4] = {false, false, false, false};
+bool btnRaw[4]   = {false, false, false, false};
+unsigned long btnChange[4] = {0, 0, 0, 0};
 
-const int PIN_GRAB    = 25;
-const int PIN_RELEASE = 26;
-const int PIN_STOP    = 27;
+String rx;
 
-// Centro aproximado de joystick
-const int ADC_CENTER = 2048;
-const int DEAD_ZONE = 220;
-
-// 0=A drones, 1=B Baxter, 2=C Baxter suave
-int mode = 0;
-
-unsigned long lastSend = 0;
-const unsigned long SEND_PERIOD_MS = 50;
-
-bool oldGrab = HIGH;
-bool oldRelease = HIGH;
-bool oldStop = HIGH;
-
-// ---------------------------------------------------------
-float normalizeAxis(int value) {
-  int delta = value - ADC_CENTER;
-
-  if (abs(delta) < DEAD_ZONE) return 0.0f;
-
-  float result;
-
-  if (delta > 0) {
-    result = (float)(delta - DEAD_ZONE) /
-             (float)(4095 - ADC_CENTER - DEAD_ZONE);
-  } else {
-    result = (float)(delta + DEAD_ZONE) /
-             (float)(ADC_CENTER - DEAD_ZONE);
-  }
-
-  return constrain(result, -1.0f, 1.0f);
+int readAxis(int i) {
+  // promedio de 4 lecturas para reducir ruido del ADC
+  long s = 0;
+  for (int k = 0; k < 4; k++) s += analogRead(PIN_AXIS[i]);
+  int raw = s / 4;                                 // 0..4095
+  float v = (raw - center[i]) / (raw >= center[i] ? (4095.0f - center[i]) : (float)center[i]);
+  if (fabs(v) < DEADZONE) return 0;
+  v = (v > 0 ? v - DEADZONE : v + DEADZONE) / (1.0f - DEADZONE);   // reescala tras zona muerta
+  v *= SIGN[i];
+  return constrain((int)(v * 1000), -1000, 1000);
 }
 
-// ---------------------------------------------------------
-void connectWiFi() {
-  Serial.print("Conectando a WiFi");
-
-  WiFi.begin(SSID, PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+uint8_t buttons() {
+  uint8_t mask = 0;
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    bool pressed = (digitalRead(PIN_BTN[i]) == LOW);
+    if (pressed != btnRaw[i]) { btnRaw[i] = pressed; btnChange[i] = now; }       // anti-rebote
+    if (now - btnChange[i] > DEBOUNCE_MS) btnState[i] = btnRaw[i];
+    if (btnState[i]) mask |= (1 << i);
   }
-
-  Serial.println();
-  Serial.println("WiFi conectado");
-  Serial.print("IP ESP32: ");
-  Serial.println(WiFi.localIP());
+  return mask;
 }
 
-// ---------------------------------------------------------
-void connectServer() {
-  if (client.connected()) return;
-
-  Serial.println("Conectando al servidor Python...");
-
-  if (client.connect(SERVER_IP, SERVER_PORT)) {
-    Serial.println("Servidor conectado");
-    client.println("STOP");
-  } else {
-    Serial.println("No se pudo conectar al servidor");
-  }
-}
-
-// ---------------------------------------------------------
-void sendCommand(const String &cmd) {
-  connectServer();
-
-  if (client.connected()) {
-    client.println(cmd);
-    Serial.print("TX: ");
-    Serial.println(cmd);
-  }
-}
-
-// ---------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-
-  pinMode(PIN_GRAB, INPUT_PULLUP);
-  pinMode(PIN_RELEASE, INPUT_PULLUP);
-  pinMode(PIN_STOP, INPUT_PULLUP);
-
   analogReadResolution(12);
-
-  connectWiFi();
-  connectServer();
-
-  Serial.println("Consola ESP32 lista");
-  Serial.println("Modo inicial: A - drones");
+  for (int i = 0; i < 4; i++) pinMode(PIN_BTN[i], INPUT_PULLUP);
+  pinMode(PIN_LED_STATE, OUTPUT);
+  pinMode(PIN_LED_BEAT, OUTPUT);
+  delay(500);                                      // dejar estabilizar los joysticks
+  // Calibracion del centro: NO tocar los joysticks al encender
+  for (int i = 0; i < 4; i++) {
+    long s = 0;
+    for (int k = 0; k < 64; k++) { s += analogRead(PIN_AXIS[i]); delay(2); }
+    center[i] = s / 64;
+  }
 }
 
-// ---------------------------------------------------------
+void sendFrame() {
+  int a[4];
+  for (int i = 0; i < 4; i++) a[i] = readAxis(i);
+  char payload[48];
+  snprintf(payload, sizeof(payload), "J,%d,%d,%d,%d,%d", a[0], a[1], a[2], a[3], buttons());
+  uint8_t cs = 0;
+  for (char *c = payload; *c; c++) cs ^= (uint8_t)*c;
+  char out[64];
+  snprintf(out, sizeof(out), "$%s*%02X", payload, cs);
+  Serial.println(out);
+}
+
+void handleSerialIn() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      rx.trim();
+      if (rx == "L1") digitalWrite(PIN_LED_STATE, HIGH);
+      else if (rx == "L0") digitalWrite(PIN_LED_STATE, LOW);
+      rx = "";
+    } else if (rx.length() < 8) {
+      rx += c;
+    }
+  }
+}
+
 void loop() {
-
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  handleSerialIn();
+  if (now - last >= PERIOD_MS) {
+    last = now;
+    sendFrame();
+    digitalWrite(PIN_LED_BEAT, (now / 250) % 2);   // latido
   }
-
-  connectServer();
-
-  // -------- BOTONES --------
-  bool grab = digitalRead(PIN_GRAB);
-  bool release = digitalRead(PIN_RELEASE);
-  bool stopButton = digitalRead(PIN_STOP);
-
-  if (grab == LOW && oldGrab == HIGH) {
-    sendCommand("GRAB");
-  }
-
-  if (release == LOW && oldRelease == HIGH) {
-    sendCommand("RELEASE");
-  }
-
-  if (stopButton == LOW && oldStop == HIGH) {
-    sendCommand("STOP");
-  }
-
-  oldGrab = grab;
-  oldRelease = release;
-  oldStop = stopButton;
-
-  // -------- MOVIMIENTO --------
-  if (millis() - lastSend >= SEND_PERIOD_MS) {
-
-    lastSend = millis();
-
-    float x = normalizeAxis(analogRead(PIN_JOY_X));
-    float y = normalizeAxis(analogRead(PIN_JOY_Y));
-
-    // El potenciómetro controla Z
-    float z = normalizeAxis(analogRead(PIN_Z));
-
-    String command;
-
-    if (mode == 0) {
-      command = "A," + String(x, 3) + "," +
-                String(y, 3) + "," +
-                String(z, 3);
-    }
-    else if (mode == 1) {
-      command = "B," + String(x, 3) + "," +
-                String(y, 3) + "," +
-                String(z, 3);
-    }
-    else {
-      command = "C," + String(x, 3) + "," +
-                String(y, 3) + "," +
-                String(z, 3);
-    }
-
-    sendCommand(command);
-  }
-
-  delay(2);
 }
