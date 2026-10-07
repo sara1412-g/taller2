@@ -1,342 +1,183 @@
 """
-PARTE B
-Baxter en PyBullet controlado por ESP32.
+Parte B - Baxter: movilidad real de brazos, posicionamiento y pick & place con la ESP32.
 
-Comandos:
-    B,x,y,z
-    GRAB
-    RELEASE
-    STOP
-    RESET
+Consola ESP32                              Teclado (si se omite --port)
+  Joystick izq: lx -> izquierda/derecha     A / D
+                ly -> adelante/atras        W / S
+  Joystick der: ry -> subir/bajar mano      I / K
+  Boton A -> cerrar/abrir pinza (agarra el cubo si esta a < 10 cm)     1
+  Boton B -> cambiar de brazo (izquierdo <-> derecho)                  2
+  Boton C -> volver el brazo activo a su pose inicial                  3
+  Boton D -> reponer el cubo en su posicion inicial                    4
 
-Ejemplo:
-    python parte_b/baxter_server.py --robot_repo ./pybullet_robots
+Los ejes se interpretan en el marco del robot: "adelante" es hacia donde mira Baxter.
+Cada brazo se mueve con cinematica inversa (IK) hacia un objetivo (esfera roja) que el
+joystick desplaza con velocidad limitada y filtro paso-bajo -> movimiento fluido.
+
+Uso:
+  python esp32_baxter.py --port COM5
+  python esp32_baxter.py                  # teclado
+  python esp32_baxter.py --auto           # demostracion automatica de pick & place
+  python esp32_baxter.py --list-joints    # imprime la tabla de articulaciones del URDF
 """
-
 import argparse
-import math
 import os
-import socket
-import threading
+import sys
 import time
 
 import numpy as np
 import pybullet as p
 import pybullet_data
 
-
-HOST = "0.0.0.0"
-PORT = 5000
-
-TARGET = np.array([0.20, 0.00, -0.10], dtype=float)
-
-LOCK = threading.Lock()
-RUNNING = True
-
-GRASP_CONSTRAINT = None
-OBJECT_ID = None
-BAXTER_ID = None
-END_EFFECTOR = 48
-
-
-def clamp(v, low, high):
-    return max(low, min(high, v))
-
-
-def parse_command(line):
-    global TARGET, GRASP_CONSTRAINT
-
-    line = line.strip()
-
-    if line.upper() == "STOP":
-        return "OK STOP"
-
-    if line.upper() == "GRAB":
-        grab_object()
-        return "OK GRAB"
-
-    if line.upper() == "RELEASE":
-        release_object()
-        return "OK RELEASE"
-
-    if line.upper() == "RESET":
-        reset_scene()
-        return "OK RESET"
-
-    parts = line.split(",")
-
-    if len(parts) == 4 and parts[0].upper() == "B":
-        try:
-            # Limites conservadores para evitar referencias absurdas.
-            x = clamp(float(parts[1]), -0.2, 0.7)
-            y = clamp(float(parts[2]), -0.8, 0.8)
-            z = clamp(float(parts[3]), -0.4, 0.4)
-        except ValueError:
-            return "ERROR NUMERIC"
-
-        with LOCK:
-            TARGET[:] = [x, y, z]
-
-        return "OK TARGET"
-
-    return "ERROR COMMAND"
-
-
-def client_worker(conn, address):
-    print(f"[TCP] Cliente: {address}")
-
-    try:
-        buffer = b""
-
-        while RUNNING:
-            data = conn.recv(1024)
-            if not data:
-                break
-
-            buffer += data
-
-            while b"\n" in buffer:
-                raw, buffer = buffer.split(b"\n", 1)
-                line = raw.decode("utf-8", errors="ignore")
-                response = parse_command(line)
-                conn.sendall((response + "\n").encode())
-
-    except ConnectionResetError:
-        pass
-    finally:
-        conn.close()
-
-
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(2)
-
-    print(f"[TCP] Baxter escuchando en puerto {PORT}")
-
-    while RUNNING:
-        conn, address = server.accept()
-        threading.Thread(
-            target=client_worker,
-            args=(conn, address),
-            daemon=True
-        ).start()
-
-
-def find_joint_by_name(body, names):
-    wanted = set(names)
-
-    for i in range(p.getNumJoints(body)):
-        info = p.getJointInfo(body, i)
-        name = info[1].decode("utf-8")
-
-        if name in wanted:
-            return i
-
-    return None
-
-
-def move_arm(target):
-    """Cinemática inversa y control de posición."""
-    global BAXTER_ID
-
-    joint_poses = p.calculateInverseKinematics(
-        BAXTER_ID,
-        END_EFFECTOR,
-        target.tolist()
-    )
-
-    for i in range(p.getNumJoints(BAXTER_ID)):
-        info = p.getJointInfo(BAXTER_ID, i)
-        q_index = info[3]
-        pose_index = q_index - 7
-
-        # El modelo de Baxter del repositorio referencia los índices
-        # articulares del resultado de IK con el desplazamiento -7,
-        # tal como se hace en baxter_ik_demo.py.
-        if pose_index >= 0 and pose_index < len(joint_poses):
-            p.setJointMotorControl2(
-                bodyIndex=BAXTER_ID,
-                jointIndex=i,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=joint_poses[pose_index],
-                force=200
-            )
-
-
-def create_object():
-    global OBJECT_ID
-
-    collision = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[0.04, 0.04, 0.04]
-    )
-
-    visual = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[0.04, 0.04, 0.04],
-        rgbaColor=[0.9, 0.2, 0.1, 1]
-    )
-
-    OBJECT_ID = p.createMultiBody(
-        baseMass=0.2,
-        baseCollisionShapeIndex=collision,
-        baseVisualShapeIndex=visual,
-        basePosition=[0.30, 0.0, 0.04]
-    )
-
-
-def grab_object():
-    global GRASP_CONSTRAINT
-
-    if GRASP_CONSTRAINT is not None:
-        return
-
-    if OBJECT_ID is None:
-        return
-
-    state = p.getLinkState(BAXTER_ID, END_EFFECTOR)
-    ee_pos = np.array(state[4])
-
-    obj_pos, _ = p.getBasePositionAndOrientation(OBJECT_ID)
-    distance = np.linalg.norm(ee_pos - np.array(obj_pos))
-
-    print(f"[GRAB] Distancia efector-objeto: {distance:.3f} m")
-
-    # Se permite agarre cuando el efector está cerca.
-    if distance < 0.18:
-        GRASP_CONSTRAINT = p.createConstraint(
-            parentBodyUniqueId=BAXTER_ID,
-            parentLinkIndex=END_EFFECTOR,
-            childBodyUniqueId=OBJECT_ID,
-            childLinkIndex=-1,
-            jointType=p.JOINT_FIXED,
-            jointAxis=[0, 0, 0],
-            parentFramePosition=[0, 0, 0],
-            childFramePosition=[0, 0, 0]
-        )
-
-        print("[GRAB] Objeto agarrado.")
-    else:
-        print("[GRAB] Objeto demasiado lejos.")
-
-
-def release_object():
-    global GRASP_CONSTRAINT
-
-    if GRASP_CONSTRAINT is not None:
-        p.removeConstraint(GRASP_CONSTRAINT)
-        GRASP_CONSTRAINT = None
-        print("[RELEASE] Objeto liberado.")
-
-
-def reset_scene():
-    global GRASP_CONSTRAINT
-
-    release_object()
-
-    p.resetBasePositionAndOrientation(
-        BAXTER_ID,
-        [0.5, -0.8, 0.0],
-        [0.0, 0.0, -1.0, -1.0]
-    )
-
-    p.resetBasePositionAndOrientation(
-        OBJECT_ID,
-        [0.30, 0.0, 0.04],
-        [0, 0, 0, 1]
-    )
-
-    with LOCK:
-        TARGET[:] = [0.20, 0.00, -0.10]
-
-
-def load_baxter(robot_repo):
-    global BAXTER_ID
-
-    robot_repo = os.path.abspath(robot_repo)
-
-    data_path = os.path.join(
-        robot_repo,
-        "data"
-    )
-
-    # El repositorio original contiene los recursos de Baxter.
-    p.setAdditionalSearchPath(data_path)
-
-    urdf = os.path.join(
-        data_path,
-        "baxter_common",
-        "baxter_description",
-        "urdf",
-        "toms_baxter.urdf"
-    )
-
-    if not os.path.exists(urdf):
-        raise FileNotFoundError(
-            "No se encontró toms_baxter.urdf. "
-            "Verifique --robot_repo."
-        )
-
-    BAXTER_ID = p.loadURDF(
-        urdf,
-        useFixedBase=True
-    )
-
-
-def main():
-    global RUNNING
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--robot_repo",
-        default="./pybullet_robots",
-        help="Ruta al repositorio pybullet_robots"
-    )
-    args = parser.parse_args()
-
-    p.connect(p.GUI)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from common.baxter_lib import (BASE_YAW0, IK_RATE, BaxterRobot, make_marker,  # noqa: E402
+                               make_pedestal)
+from common.esp32_link import BTN_A, BTN_B, BTN_C, BTN_D, EdgeDetector, LowPass, open_link  # noqa: E402
+
+SIM_HZ = 240
+CUBE_URDF = "cube_small.urdf"
+
+
+def build_scene(client, robot):
+    """Pedestal con un cubo y una placa de destino, ubicados respecto a la pose inicial de la mano."""
+    home = robot.arms["left"].home_local
+    top_z = home[2] - 0.14                                   # cara superior del pedestal (local)
+    quat = p.getQuaternionFromEuler([0, 0, BASE_YAW0 + robot.yaw])
+    plane_z = -1.0
+    half = [0.25, 0.30, (top_z - plane_z) / 2]
+    center_local = [home[0] + 0.10, home[1] - 0.10, plane_z + half[2]]
+    make_pedestal(client, robot.local_to_world(center_local).tolist(), half, quat)
+
+    cube_local = np.array([home[0] + 0.10, home[1], top_z + 0.03])
+    goal_local = np.array([home[0] + 0.10, home[1] - 0.20, top_z + 0.003])
+    cube_start = robot.local_to_world(cube_local)
+    cube = p.loadURDF(CUBE_URDF, cube_start.tolist(), globalScaling=0.8, physicsClientId=client)
+    p.changeVisualShape(cube, -1, rgbaColor=[0.1, 0.4, 1, 1], physicsClientId=client)
+    make_marker(client, robot.local_to_world(goal_local).tolist(), 0.05, (1, 0.8, 0, 0.9))
+    return cube, cube_start, robot.local_to_world(goal_local)
+
+
+def auto_demo(robot, cube, goal_world, client):
+    """Secuencia automatica: ir al cubo, agarrar, llevarlo al destino, soltar."""
+    arm = robot.arms["left"]
+    cpos = np.array(p.getBasePositionAndOrientation(cube, physicsClientId=client)[0])
+    above = robot.world_to_local(cpos + [0, 0, 0.08])
+    at = robot.world_to_local(cpos + [0, 0, 0.0])
+    dest = robot.world_to_local(goal_world + [0, 0, 0.05])
+    dest_up = dest + [0, 0, 0.08]
+    steps = [("sobre el cubo", above), ("bajar", at), ("agarrar", None),
+             ("subir", above), ("transportar", dest_up), ("bajar", dest), ("soltar", None)]
+    return arm, steps
+
+
+def run(port, auto, gui=True):
+    client = p.connect(p.GUI if gui else p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, -9.81)
+    p.setGravity(0, 0, -10, physicsClientId=client)
+    p.setPhysicsEngineParameter(fixedTimeStep=1.0 / SIM_HZ, physicsClientId=client)
+    p.loadURDF("plane.urdf", [0, 0, -1], useFixedBase=True, physicsClientId=client)
+    robot = BaxterRobot(client, base_pos=(0.5, -0.8, 0.0), base_yaw=0.0)
+    cube, cube_start, goal_world = build_scene(client, robot)
+    p.resetDebugVisualizerCamera(2.2, 25, -25, [0.5, -0.1, -0.1], physicsClientId=client)
 
-    load_baxter(args.robot_repo)
+    target_vis = p.createMultiBody(0, -1, p.createVisualShape(
+        p.GEOM_SPHERE, radius=0.02, rgbaColor=[1, 0, 0, 0.8], physicsClientId=client),
+        [0, 0, 0], physicsClientId=client)
+    hud = None
 
-    create_object()
+    link = None if auto else open_link(port, client)
+    edges, smooth = EdgeDetector(), LowPass(0.25, 3)
+    active = "left"
+    dt = 1.0 / IK_RATE
+    sub = int(SIM_HZ / IK_RATE)
 
-    p.resetDebugVisualizerCamera(
-        cameraDistance=2.0,
-        cameraYaw=180,
-        cameraPitch=-15,
-        cameraTargetPosition=[0.4, 0, 0.3]
-    )
+    if auto:
+        arm_a, plan = auto_demo(robot, cube, goal_world, client)
+        plan_i, settle = 0, 0
 
-    threading.Thread(
-        target=start_server,
-        daemon=True
-    ).start()
-
-    print("PARTE B lista.")
-    print("Use la ESP32 o envíe comandos TCP.")
-    print("Ctrl+C para finalizar.")
-
+    print("Listo. Brazo activo: left. (Ctrl+C para salir)")
+    t0 = time.time()
+    k = 0
     try:
         while True:
-            with LOCK:
-                target = TARGET.copy()
+            for _ in range(sub):
+                p.stepSimulation(physicsClientId=client)
+            k += 1
+            arm = robot.arms[active]
 
-            move_arm(target)
+            if auto:
+                if plan_i >= len(plan):
+                    for _ in range(SIM_HZ):          # 1 s para que el cubo se asiente
+                        p.stepSimulation(physicsClientId=client)
+                    pos = np.array(p.getBasePositionAndOrientation(cube, physicsClientId=client)[0])
+                    print(f"[auto] fin. Cubo a {np.linalg.norm(pos - goal_world):.3f} m del destino")
+                    break
+                name, tgt = plan[plan_i]
+                if tgt is None:
+                    robot.toggle_grip(arm_a, [cube])
+                    settle = 0
+                    plan_i += 1
+                else:
+                    arm_a.target_local += np.clip(tgt - arm_a.target_local, -0.4 * dt, 0.4 * dt)
+                    if np.linalg.norm(tgt - arm_a.target_local) < 0.01:
+                        settle += 1
+                        if settle > 30:
+                            settle, plan_i = 0, plan_i + 1
+            else:
+                fr = link.read()
+                pr = edges.pressed(fr)
+                if pr & BTN_B:
+                    active = "right" if active == "left" else "left"
+                    arm = robot.arms[active]
+                    print("Brazo activo:", active)
+                if pr & BTN_A:
+                    held = robot.toggle_grip(arm, [cube])
+                    link.send_led(arm.closed)
+                    print(f"Pinza {'cerrada' if arm.closed else 'abierta'}"
+                          f"{' - OBJETO AGARRADO' if held else ''}")
+                if pr & BTN_C:
+                    robot.go_home(arm)
+                if pr & BTN_D and arm.held is None:
+                    p.resetBasePositionAndOrientation(cube, cube_start.tolist(), [0, 0, 0, 1],
+                                                      physicsClientId=client)
+                lx, ly, ry = smooth(fr.lx, fr.ly, fr.ry)
+                # stick arriba -> adelante (+x local); stick derecha -> derecha del robot (-y local)
+                robot.move_target(arm, [ly, -lx, ry], dt)
 
-            p.stepSimulation()
-            time.sleep(1 / 240)
+            for a in robot.arms.values():
+                robot.update_arm(a)
+            p.resetBasePositionAndOrientation(
+                target_vis, robot.local_to_world(robot.arms[active].target_local).tolist(),
+                [0, 0, 0, 1], physicsClientId=client)
 
+            if gui and k % 15 == 0:
+                state = "cerrada" if robot.arms[active].closed else "abierta"
+                ok = "AUTO" if auto else ("ESP32 OK" if link.connected() else "SIN SENAL")
+                hud = p.addUserDebugText(f"Brazo: {active} | Pinza: {state} | {ok}",
+                                         [0.0, -0.8, 0.9], textColorRGB=[0, 0, 0], textSize=1.4,
+                                         replaceItemUniqueId=hud if hud is not None else -1,
+                                         physicsClientId=client)
+            # sincronizacion con el reloj (tiempo real)
+            wait = t0 + k / IK_RATE - time.time()
+            if gui and wait > 0:
+                time.sleep(wait)
     except KeyboardInterrupt:
         pass
-
     finally:
-        RUNNING = False
-        p.disconnect()
+        if link:
+            link.close()
+        p.disconnect(client)
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Baxter + ESP32 (parte B)")
+    ap.add_argument("--port", default=None, help="puerto serie de la ESP32 (omitir = teclado)")
+    ap.add_argument("--auto", action="store_true", help="demo automatica de pick & place")
+    ap.add_argument("--headless", action="store_true", help="sin ventana (solo con --auto)")
+    ap.add_argument("--list-joints", action="store_true")
+    a = ap.parse_args()
+    if a.list_joints:
+        c = p.connect(p.DIRECT)
+        BaxterRobot(c).list_joints()
+    else:
+        run(a.port, a.auto, gui=not a.headless)
