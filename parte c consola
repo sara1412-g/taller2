@@ -1,308 +1,176 @@
-
-Comandos:
-    C,x,y,z
-    GRAB
-    RELEASE
-    STOP
-    RESET
-
-El objetivo recibido no se aplica de golpe.
-Se utiliza interpolación exponencial:
-    p(t+1) = p(t) + alpha*(p_obj - p(t))
 """
+Parte C - Consola de mandos ESP32 para un movimiento fluido y movilidad real de Baxter
+en un entorno de laboratorio (escena "botlab" de pybullet_data, la misma del ejemplo atlas.py).
 
+A diferencia de la parte B (robot fijo + pick & place), aqui el robot COMPLETO se desplaza:
+la base se mueve con el joystick izquierdo y, a la vez, el brazo activo se mueve con el derecho.
+
+Consola ESP32                               Teclado (si se omite --port)
+  Joystick izq: ly -> avanzar / retroceder    W / S
+                lx -> girar el robot          A / D
+  Joystick der: rx -> mano a izq/der          J / L
+                ry -> mano adelante/atras     I / K   (con D mantenido: sube/baja)
+  Boton A -> cerrar/abrir pinza del brazo activo                1
+  Boton B -> cambiar de brazo activo                            2
+  Boton C -> brazo activo a su pose inicial                     3
+  Boton D (mantener) -> el eje ry controla la ALTURA            4
+
+La velocidad de la base se suaviza con un filtro paso-bajo y con limite de aceleracion
+(rampa), de modo que arranca y frena sin tirones aunque el joystick cambie de golpe.
+La base se mueve de forma cinematica (resetBasePositionAndOrientation), igual que el demo
+original posiciona al robot; los brazos siguen usando fisica con motores y IK.
+
+Uso:
+  python esp32_baxter_movilidad.py --port COM5
+  python esp32_baxter_movilidad.py                     # teclado
+  python esp32_baxter_movilidad.py --no-scene          # solo plano (si falla la escena)
+  python esp32_baxter_movilidad.py --floor-z -0.5      # forzar altura del suelo de la escena
+"""
 import argparse
+import math
 import os
-import socket
-import threading
+import sys
 import time
 
 import numpy as np
 import pybullet as p
 import pybullet_data
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from common.baxter_lib import BASE_YAW0, IK_RATE, BaxterRobot  # noqa: E402
+from common.esp32_link import BTN_A, BTN_B, BTN_C, BTN_D, EdgeDetector, LowPass, open_link  # noqa: E402
 
-HOST = "0.0.0.0"
-PORT = 5000
-
-TARGET = np.array([0.20, 0.00, -0.10], dtype=float)
-CURRENT = TARGET.copy()
-
-ALPHA = 0.06
-
-LOCK = threading.Lock()
-RUNNING = True
-
-BAXTER_ID = None
-OBJECT_ID = None
-END_EFFECTOR = 48
-GRASP_CONSTRAINT = None
+SIM_HZ = 240
+MAX_V = 0.6          # m/s velocidad lineal maxima de la base
+MAX_W = 1.0          # rad/s velocidad angular maxima
+MAX_ACC = 1.2        # m/s^2 limite de aceleracion lineal
+MAX_ALPHA = 2.5      # rad/s^2 limite de aceleracion angular
+BASE_HEIGHT = 1.0    # m del suelo al origen de Baxter (en el demo: plano en z=-1 y base en z=0)
 
 
-def clamp(v, low, high):
-    return max(low, min(high, v))
-
-
-def parse_command(line):
-    global TARGET
-
-    line = line.strip()
-
-    if line.upper() == "STOP":
-        with LOCK:
-            TARGET[:] = CURRENT
-        return "OK STOP"
-
-    if line.upper() == "GRAB":
-        grab_object()
-        return "OK GRAB"
-
-    if line.upper() == "RELEASE":
-        release_object()
-        return "OK RELEASE"
-
-    if line.upper() == "RESET":
-        reset_scene()
-        return "OK RESET"
-
-    parts = line.split(",")
-
-    if len(parts) == 4 and parts[0].upper() == "C":
+def load_scene(client, use_scene, floor_z, spawn_xy):
+    """Carga botlab (como atlas.py) y devuelve la altura del suelo bajo el punto de aparicion."""
+    if use_scene:
         try:
-            x = clamp(float(parts[1]), -0.2, 0.7)
-            y = clamp(float(parts[2]), -0.8, 0.8)
-            z = clamp(float(parts[3]), -0.4, 0.4)
-        except ValueError:
-            return "ERROR NUMERIC"
-
-        with LOCK:
-            TARGET[:] = [x, y, z]
-
-        return "OK TARGET"
-
-    return "ERROR COMMAND"
-
-
-def client_worker(conn, address):
-    print(f"[TCP] Cliente: {address}")
-
-    try:
-        buffer = b""
-
-        while RUNNING:
-            data = conn.recv(1024)
-            if not data:
-                break
-
-            buffer += data
-
-            while b"\n" in buffer:
-                raw, buffer = buffer.split(b"\n", 1)
-                response = parse_command(
-                    raw.decode("utf-8", errors="ignore")
-                )
-                conn.sendall((response + "\n").encode())
-
-    except ConnectionResetError:
-        pass
-    finally:
-        conn.close()
+            objs = p.loadSDF("botlab/botlab.sdf", globalScaling=2.0, physicsClientId=client)
+            y2x = p.getQuaternionFromEuler([math.pi / 2, 0, math.pi / 2])
+            for o in objs:                                    # convertir eje Y -> Z (igual que atlas.py)
+                pos, orn = p.getBasePositionAndOrientation(o, physicsClientId=client)
+                npos, norn = p.multiplyTransforms([0, 0, 0], y2x, pos, orn)
+                p.resetBasePositionAndOrientation(o, npos, norn, physicsClientId=client)
+            if floor_z is None:
+                # El suelo es la superficie mas baja bajo el robot: lanzar rayos desde varias alturas
+                starts = np.linspace(-3.0, 3.0, 25)
+                frm = [[spawn_xy[0], spawn_xy[1], float(z)] for z in starts]
+                to = [[spawn_xy[0], spawn_xy[1], -10.0]] * len(starts)
+                hits = p.rayTestBatch(frm, to, physicsClientId=client)
+                zs = [h[3][2] for h in hits if h[0] >= 0]
+                floor_z = min(zs) if zs else -1.0
+            return floor_z
+        except Exception as e:                                # noqa: BLE001
+            print("No se pudo cargar botlab:", e, "-> usando plano")
+    p.loadURDF("plane.urdf", [0, 0, -1], useFixedBase=True, physicsClientId=client)
+    return -1.0
 
 
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(2)
-
-    print(f"[TCP] Consola Baxter en puerto {PORT}")
-
-    while RUNNING:
-        conn, address = server.accept()
-        threading.Thread(
-            target=client_worker,
-            args=(conn, address),
-            daemon=True
-        ).start()
+def ramp(current, target, max_step):
+    """Mueve `current` hacia `target` sin exceder `max_step` (limite de aceleracion)."""
+    return current + max(-max_step, min(max_step, target - current))
 
 
-def move_arm(target):
-    global CURRENT
-
-    # Suavizado de trayectoria.
-    with LOCK:
-        CURRENT[:] = CURRENT + ALPHA * (target - CURRENT)
-        command_target = CURRENT.copy()
-
-    joint_poses = p.calculateInverseKinematics(
-        BAXTER_ID,
-        END_EFFECTOR,
-        command_target.tolist()
-    )
-
-    for i in range(p.getNumJoints(BAXTER_ID)):
-        info = p.getJointInfo(BAXTER_ID, i)
-        q_index = info[3]
-        pose_index = q_index - 7
-
-        # El modelo de Baxter del repositorio referencia los índices
-        # articulares del resultado de IK con el desplazamiento -7,
-        # tal como se hace en baxter_ik_demo.py.
-        if pose_index >= 0 and pose_index < len(joint_poses):
-            p.setJointMotorControl2(
-                bodyIndex=BAXTER_ID,
-                jointIndex=i,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=joint_poses[pose_index],
-                force=200
-            )
-
-
-def create_object():
-    global OBJECT_ID
-
-    collision = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[0.04, 0.04, 0.04]
-    )
-
-    visual = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[0.04, 0.04, 0.04],
-        rgbaColor=[0.9, 0.2, 0.1, 1]
-    )
-
-    OBJECT_ID = p.createMultiBody(
-        baseMass=0.2,
-        baseCollisionShapeIndex=collision,
-        baseVisualShapeIndex=visual,
-        basePosition=[0.30, 0.0, 0.04]
-    )
-
-
-def grab_object():
-    global GRASP_CONSTRAINT
-
-    if GRASP_CONSTRAINT is not None:
-        return
-
-    state = p.getLinkState(BAXTER_ID, END_EFFECTOR)
-    ee_pos = np.array(state[4])
-
-    obj_pos, _ = p.getBasePositionAndOrientation(OBJECT_ID)
-
-    if np.linalg.norm(ee_pos - np.array(obj_pos)) < 0.18:
-        GRASP_CONSTRAINT = p.createConstraint(
-            BAXTER_ID,
-            END_EFFECTOR,
-            OBJECT_ID,
-            -1,
-            p.JOINT_FIXED,
-            [0, 0, 0],
-            [0, 0, 0],
-            [0, 0, 0]
-        )
-
-        print("[GRAB] Objeto agarrado.")
-    else:
-        print("[GRAB] Acérquese al objeto antes de agarrar.")
-
-
-def release_object():
-    global GRASP_CONSTRAINT
-
-    if GRASP_CONSTRAINT is not None:
-        p.removeConstraint(GRASP_CONSTRAINT)
-        GRASP_CONSTRAINT = None
-        print("[RELEASE] Objeto liberado.")
-
-
-def reset_scene():
-    global CURRENT, TARGET
-
-    release_object()
-
-    p.resetBasePositionAndOrientation(
-        OBJECT_ID,
-        [0.30, 0.0, 0.04],
-        [0, 0, 0, 1]
-    )
-
-    with LOCK:
-        CURRENT[:] = [0.20, 0.00, -0.10]
-        TARGET[:] = CURRENT
-
-
-def main():
-    global BAXTER_ID, RUNNING
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--robot_repo",
-        default="./pybullet_robots"
-    )
-    args = parser.parse_args()
-
-    p.connect(p.GUI)
+def run(port, use_scene, floor_z, spawn_xy):
+    client = p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, -9.81)
+    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0, physicsClientId=client)
+    p.setGravity(0, 0, -10, physicsClientId=client)
+    p.setPhysicsEngineParameter(fixedTimeStep=1.0 / SIM_HZ, physicsClientId=client)
 
-    robot_repo = os.path.abspath(args.robot_repo)
+    floor = load_scene(client, use_scene, floor_z, spawn_xy)
+    robot = BaxterRobot(client, base_pos=(spawn_xy[0], spawn_xy[1], floor + BASE_HEIGHT), base_yaw=0.0)
+    # vistas de camara sintetica RGB / profundidad / segmentacion (como en el ExampleBrowser)
+    for flag in (p.COV_ENABLE_RGB_BUFFER_PREVIEW, p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
+                 p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW):
+        p.configureDebugVisualizer(flag, 1, physicsClientId=client)
+    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1, physicsClientId=client)
 
-    urdf = os.path.join(
-        robot_repo,
-        "data",
-        "baxter_common",
-        "baxter_description",
-        "urdf",
-        "toms_baxter.urdf"
-    )
+    link = open_link(port, client)
+    edges = EdgeDetector()
+    lp_arm = LowPass(0.25, 3)
+    active = "left"
+    v = w = 0.0                                   # velocidades actuales de la base
+    dt = 1.0 / IK_RATE
+    sub = int(SIM_HZ / IK_RATE)
+    hud = None
+    p.resetDebugVisualizerCamera(2.4, 0, -20, [spawn_xy[0], spawn_xy[1], floor + 1.3], physicsClientId=client)
 
-    if not os.path.exists(urdf):
-        raise FileNotFoundError(
-            "No se encontró toms_baxter.urdf."
-        )
-
-    BAXTER_ID = p.loadURDF(
-        urdf,
-        useFixedBase=True
-    )
-
-    create_object()
-
-    p.resetDebugVisualizerCamera(
-        2.0,
-        180,
-        -15,
-        [0.4, 0, 0.3]
-    )
-
-    threading.Thread(
-        target=start_server,
-        daemon=True
-    ).start()
-
-    print("PARTE C lista.")
-    print("Movimiento fluido habilitado.")
-    print("ALPHA =", ALPHA)
-
+    print("Listo. Joystick izq = conducir, joystick der = brazo. Ctrl+C para salir.")
+    t0, k = time.time(), 0
     try:
         while True:
-            with LOCK:
-                target = TARGET.copy()
+            for _ in range(sub):
+                p.stepSimulation(physicsClientId=client)
+            k += 1
+            fr = link.read()
+            pr = edges.pressed(fr)
+            arm = robot.arms[active]
 
-            move_arm(target)
+            if pr & BTN_B:
+                active = "right" if active == "left" else "left"
+                arm = robot.arms[active]
+            if pr & BTN_A:
+                robot.toggle_grip(arm, [])
+                link.send_led(arm.closed)
+            if pr & BTN_C:
+                robot.go_home(arm)
 
-            p.stepSimulation()
-            time.sleep(1 / 240)
+            # ---------- base: velocidad objetivo -> rampa -> integracion ----------
+            v_t, w_t = fr.ly * MAX_V, -fr.lx * MAX_W
+            v = ramp(v, v_t, MAX_ACC * dt)
+            w = ramp(w, w_t, MAX_ALPHA * dt)
+            yaw = robot.yaw + w * dt
+            heading = BASE_YAW0 + yaw                 # direccion "adelante" del robot en el mundo
+            pos = robot.base_pos + np.array([math.cos(heading), math.sin(heading), 0]) * v * dt
+            robot.set_base(pos, yaw)
 
+            # ---------- brazo activo: rx lateral, ry adelante (o altura con D) ----------
+            rx, ry, _ = lp_arm(fr.rx, fr.ry, 0.0)
+            if fr.btn & BTN_D:
+                d = [0.0, -rx, ry]
+            else:
+                d = [ry, -rx, 0.0]
+            robot.move_target(arm, d, dt)
+            for a in robot.arms.values():
+                robot.update_arm(a)
+
+            # ---------- la camara sigue al robot (el usuario puede rotarla con el raton) ----------
+            if k % 4 == 0:
+                cam = p.getDebugVisualizerCamera(physicsClientId=client)
+                p.resetDebugVisualizerCamera(cam[10], cam[8], cam[9],
+                                             (robot.base_pos + [0, 0, 0.3]).tolist(),
+                                             physicsClientId=client)
+            if k % 15 == 0:
+                hud = p.addUserDebugText(
+                    f"v={v:+.2f} m/s w={w:+.2f} rad/s | brazo {active} | "
+                    f"pinza {'cerrada' if arm.closed else 'abierta'} | "
+                    f"{'ESP32 OK' if link.connected() else 'SIN SENAL'}",
+                    (robot.base_pos + [0, 0, 1.4]).tolist(), textColorRGB=[0, 0, 0], textSize=1.3,
+                    replaceItemUniqueId=hud if hud is not None else -1, physicsClientId=client)
+
+            wait = t0 + k / IK_RATE - time.time()
+            if wait > 0:
+                time.sleep(wait)
     except KeyboardInterrupt:
         pass
-
     finally:
-        RUNNING = False
-        p.disconnect()
+        link.close()
+        p.disconnect(client)
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Baxter con movilidad + ESP32 (parte C)")
+    ap.add_argument("--port", default=None, help="puerto serie de la ESP32 (omitir = teclado)")
+    ap.add_argument("--no-scene", action="store_true", help="usar solo un plano")
+    ap.add_argument("--floor-z", type=float, default=None, help="altura del suelo (si la deteccion falla)")
+    ap.add_argument("--spawn", type=float, nargs=2, default=(-2.0, 3.0), metavar=("X", "Y"))
+    a = ap.parse_args()
+    run(a.port, not a.no_scene, a.floor_z, tuple(a.spawn))
